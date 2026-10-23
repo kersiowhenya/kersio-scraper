@@ -1,279 +1,249 @@
 /**
- * Name Scrape : YouTube Scraper
+ * Name Scrape : YouTube Downloader Info (via YtDown)
  * Owner       : Kersio
- * Base        : youtube.com
+ * Base Web    : ytdown.biz.id
  * Type        : Scraper
- * Function    : Mengambil link video (dengan suara), video HD (tanpa suara), audio terbaik, dan metadata lengkap dari video YouTube / Shorts
- * Input       : 1 URL YouTube (youtube.com/watch, youtu.be, youtube.com/shorts)
+ * Function    : Mengambil info video YouTube (judul, channel, durasi, views, thumbnail) beserta semua pilihan format unduhan: video MP4 (dengan audio), audio MP3/M4A, dan video tanpa suara, lengkap dengan ukuran file dan link unduhan
+ * Input       : 1 link video YouTube (watch, shorts, youtu.be) atau ID video 11 karakter
  * Output      : JSON
- * sl               : https://whatsapp.com/channel/0029VbDecTzElah1uM12wK2G
- * Require     : Node.js 18+, yt-dlp (pip install yt-dlp), ffmpeg
- * Note        : Erorr fix sendiri y
+ * saluran     : https://whatsapp.com/channel/0029VbDecTzElah1uM12wK2G
+ * Require     : Node.js 18+ (tanpa library tambahan, tanpa puppeteer)
+ * Note        : Hanya video publik. Jangan spam request. Link unduhan dibuat oleh server situs dan bisa berhenti berfungsi kapan saja. Struktur API bisa berubah kapan saja.
  */
 
-const { execFile } = require('child_process');
-const fs = require('fs');
-const path = require('path');
+const BASE = 'https://ytdown.biz.id';
+const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36';
 
-/**
- * YouTube Scraper - Single function
- * @param {string} youtubeUrl - URL YouTube / Shorts / youtu.be
- * @returns {Promise<object>} JSON hasil scrape
- */
-async function youtube(youtubeUrl) {
-  // Helper: validasi URL
-  function isYoutubeUrl(u) {
-    return /^(https?:\/\/)?((www|m|music)\.)?(youtube\.com|youtu\.be)\//i.test(u);
-  }
+const CACHE_TTL_MS = 10 * 60 * 1000;     // hasil disimpan 10 menit
+const MIN_GAP_MS = 3000;                 // jeda minimal antar request
+const BLOCK_COOLDOWN_MS = 10 * 60 * 1000; // kalau diblokir, berhenti mencoba 10 menit
 
-  // Helper: jalankan yt-dlp
-  function runYtDlp(url) {
-    return new Promise((resolve, reject) => {
-      execFile(
-        'yt-dlp',
-        ['-J', '--no-playlist', '--no-warnings', url],
-        { maxBuffer: 100 * 1024 * 1024, timeout: 90000 },
-        (err, stdout, stderr) => {
-          if (err) {
-            err.stderrText = String(stderr || '');
-            return reject(err);
-          }
-          resolve(stdout);
-        }
-      );
-    });
-  }
+const cache = new Map();
+let queue = Promise.resolve();
+let lastRunAt = 0;
+let blockedUntil = 0;
 
-  // Helper: petakan error yt-dlp ke kode yang rapi
-  function mapError(err) {
-    const text = `${err.stderrText || ''} ${err.message || ''}`.toLowerCase();
-
-    if (err.code === 'ENOENT') {
-      return { error: 'YTDLP_NOT_INSTALLED', message: 'yt-dlp belum terpasang. Jalankan: pip install yt-dlp' };
+// Antrean: request dijalankan satu per satu dengan jeda
+function enqueue(task) {
+  const run = queue.then(async () => {
+    const wait = MIN_GAP_MS - (Date.now() - lastRunAt);
+    if (wait > 0) await new Promise((r) => setTimeout(r, wait));
+    try {
+      return await task();
+    } finally {
+      lastRunAt = Date.now();
     }
-    if (err.killed || err.signal === 'SIGTERM') {
-      return { error: 'TIMEOUT', message: 'Request terlalu lama, coba lagi nanti' };
-    }
-    if (text.includes('private video')) {
-      return { error: 'VIDEO_PRIVATE', message: 'Video bersifat private' };
-    }
-    if (text.includes('confirm your age') || text.includes('age-restricted')) {
-      return { error: 'AGE_RESTRICTED', message: 'Video dibatasi usia' };
-    }
-    if (text.includes('not a bot')) {
-      return { error: 'BOT_CHECK', message: 'YouTube meminta verifikasi bot. Coba lagi nanti.' };
-    }
-    if (text.includes('video unavailable') || text.includes('has been removed') || text.includes('not available')) {
-      return { error: 'VIDEO_UNAVAILABLE', message: 'Video tidak tersedia atau sudah dihapus' };
-    }
-    if (text.includes('unable to download') || text.includes('network') || text.includes('timed out')) {
-      return { error: 'NETWORK_ERROR', message: 'Gagal terhubung ke YouTube' };
-    }
-    return { error: 'EXCEPTION', message: (err.stderrText || err.message || 'Unknown error').trim().slice(0, 300) };
-  }
-
-  const bySizeDesc = (a, b) => (b.height || 0) - (a.height || 0) || (b.tbr || 0) - (a.tbr || 0);
-
-  // Label kualitas pakai sisi terpendek, supaya video vertikal (Shorts) tampil benar: 1080x1920 -> 1080p
-  const qLabel = (f) => {
-    if (!f) return null;
-    const s = Math.min(f.width || Infinity, f.height || Infinity);
-    return Number.isFinite(s) ? `${s}p` : null;
-  };
-
-  // ========== MAIN LOGIC ==========
-  try {
-    if (!youtubeUrl || typeof youtubeUrl !== 'string') {
-      return { success: false, error: 'INVALID_URL', message: 'URL tidak valid' };
-    }
-
-    const url = youtubeUrl.trim();
-    if (!isYoutubeUrl(url)) {
-      return { success: false, error: 'INVALID_URL', message: 'Bukan link YouTube yang valid' };
-    }
-
-    // 1. Ambil data dari yt-dlp
-    const stdout = await runYtDlp(url);
-    const d = JSON.parse(stdout);
-    const formats = (d.formats || []).filter(f => f.url && f.protocol && f.protocol.startsWith('http'));
-
-    // 2. Format gabungan (video + suara), cocok langsung diputar/diunduh
-    const combined = formats
-      .filter(f => f.vcodec !== 'none' && f.acodec !== 'none')
-      .sort(bySizeDesc)[0] || null;
-
-    // 3. Video kualitas tertinggi (biasanya tanpa suara)
-    const videoOnly = formats
-      .filter(f => f.vcodec !== 'none' && f.acodec === 'none')
-      .sort(bySizeDesc)[0] || null;
-
-    // 4. Audio terbaik
-    const audio = formats
-      .filter(f => f.vcodec === 'none' && f.acodec !== 'none')
-      .sort((a, b) => (b.abr || 0) - (a.abr || 0))[0] || null;
-
-    if (!combined && !videoOnly && !audio) {
-      return { success: false, error: 'NO_MEDIA', message: 'Tidak ditemukan media yang bisa diunduh' };
-    }
-
-    // 5. Susun output
-    return {
-      success: true,
-      original_url: url,
-      title: d.title || null,
-      author: d.uploader || d.channel || null,
-      channel_url: d.channel_url || d.uploader_url || null,
-      video_id: d.id || null,
-      duration: d.duration || null,
-      view_count: d.view_count ?? null,
-      like_count: d.like_count ?? null,
-      upload_date: d.upload_date || null,
-      is_short: /\/shorts\//i.test(url),
-      thumbnail: d.thumbnail || null,
-      quality: qLabel(combined),
-      download_url: combined?.url || null,
-      video_hd: videoOnly
-        ? {
-            quality: qLabel(videoOnly),
-            ext: videoOnly.ext || null,
-            filesize: videoOnly.filesize || videoOnly.filesize_approx || null,
-            url: videoOnly.url
-          }
-        : null,
-      audio: audio
-        ? {
-            bitrate: audio.abr ? `${Math.round(audio.abr)}kbps` : null,
-            ext: audio.ext || null,
-            filesize: audio.filesize || audio.filesize_approx || null,
-            url: audio.url
-          }
-        : null,
-      audio_url: audio?.url || null,
-      note: combined
-        ? 'download_url sudah ada suara. video_hd tidak ada suara, gabungkan dengan audio_url pakai ffmpeg jika butuh HD + suara.'
-        : 'YouTube tidak menyediakan format gabungan untuk video ini. video_hd tidak ada suara, gabungkan dengan audio_url pakai ffmpeg.'
-    };
-
-  } catch (err) {
-    if (err instanceof SyntaxError) {
-      return { success: false, error: 'PARSE_ERROR', message: 'Gagal membaca respons yt-dlp' };
-    }
-    return { success: false, ...mapError(err) };
-  }
+  });
+  queue = run.catch(() => {});
+  return run;
 }
 
+// ---------- Helper: parsing ----------
+const abs = (p) => (p ? (/^https?:\/\//i.test(p) ? p : `${BASE}${p}`) : null);
+
+// Ambil ID video dari link YouTube (watch, shorts, youtu.be, embed, live) atau ID polos
+function parseVideo(text) {
+  const t = String(text || '').trim();
+
+  if (/^[A-Za-z0-9_-]{11}$/.test(t)) return { id: t };
+
+  const patterns = [
+    /(?:youtube\.com|youtube-nocookie\.com)\/(?:watch\?(?:[^#\s]*&)?v=|shorts\/|embed\/|live\/|v\/)([A-Za-z0-9_-]{11})/i,
+    /youtu\.be\/([A-Za-z0-9_-]{11})/i
+  ];
+  for (const re of patterns) {
+    const m = t.match(re);
+    if (m) return { id: m[1] };
+  }
+
+  // Link YouTube tapi bukan link video (channel, playlist, dll)
+  if (/youtube\.com|youtu\.be/i.test(t)) return { notVideo: true };
+  return {};
+}
+
+const mapVideo = (v) => ({
+  itag: v.itag,
+  quality: v.quality,
+  raw_quality: v.rawQuality,
+  height: v.height,
+  fps: v.fps,
+  container: v.container,
+  has_audio: !!v.hasAudio,
+  type: v.type,
+  audio_lang: v.audioLang || null,
+  size_bytes: v.sizeBytes ?? null,
+  size: v.sizeFormatted || null,
+  download_url: abs(v.downloadUrl)
+});
+
+const mapAudio = (a) => ({
+  label: a.label,
+  bitrate: a.bitrate,
+  format: a.format,
+  type: a.type,
+  itag: a.itag ?? null,
+  audio_lang: a.audioLang || null,
+  size_bytes: a.sizeBytes ?? null,
+  size: a.sizeFormatted || null,
+  download_url: abs(a.downloadUrl)
+});
+
+const mapVideoOnly = (v) => ({
+  itag: v.itag,
+  quality: v.quality,
+  container: v.container,
+  fps: v.fps,
+  size_bytes: v.sizeBytes ?? null,
+  size: v.sizeFormatted || null,
+  download_url: abs(v.downloadUrl)
+});
+
+const asText = (x) => (typeof x === 'string' ? x : x ? JSON.stringify(x) : null);
+
 /**
- * YouTube MP4 - download video + suara jadi 1 file .mp4, lengkap dengan thumbnail & caption info
- * @param {string} youtubeUrl - URL YouTube / Shorts / youtu.be
+ * YouTube Downloader Info - Single function
+ * @param {string} input - Link video YouTube atau ID video
  * @param {object} [options]
- * @param {number} [options.maxRes=720]  - Kualitas maksimal (sisi terpendek), contoh 360 / 480 / 720 / 1080
- * @param {string} [options.outDir]      - Folder penyimpanan (default: ./downloads)
- * @returns {Promise<object>} JSON: thumbnail, caption, file_path, dll
+ * @param {string} [options.audioLang='id'] - Bahasa audio/dubbing ('id', 'original', dll). Kalau tidak tersedia, situs memakai audio asli
+ * @returns {Promise<object>} JSON hasil
  */
-async function youtubeMp4(youtubeUrl, options = {}) {
-  const maxRes = options.maxRes || 720;
-  const outDir = options.outDir || path.join(process.cwd(), 'downloads');
-
-  const fmtDur = (s) => {
-    if (!s) return '-';
-    const m = Math.floor(s / 60);
-    const sec = String(Math.floor(s % 60)).padStart(2, '0');
-    return `${m}:${sec}`;
-  };
-  const fmtNum = (n) => (n == null ? '-' : Number(n).toLocaleString('id-ID'));
-  const fmtDate = (d) => (d && d.length === 8 ? `${d.slice(6, 8)}-${d.slice(4, 6)}-${d.slice(0, 4)}` : '-');
-  const fmtSize = (b) => `${(b / 1024 / 1024).toFixed(1)} MB`;
-
+async function ytDown(input, options = {}) {
   try {
-    // 1. Ambil metadata dulu
-    const info = await youtube(youtubeUrl);
-    if (!info.success) return info;
+    const parsed = parseVideo(input);
 
-    // 2. Download + gabung video & audio jadi mp4
-    fs.mkdirSync(outDir, { recursive: true });
-    const outTemplate = path.join(outDir, `${info.video_id}.%(ext)s`);
-
-    await new Promise((resolve, reject) => {
-      execFile(
-        'yt-dlp',
-        [
-          '--no-playlist',
-          '--no-warnings',
-          '-f', 'bv*+ba/b',
-          '-S', `res:${maxRes},ext:mp4:m4a`,
-          '--merge-output-format', 'mp4',
-          '-o', outTemplate,
-          info.original_url
-        ],
-        { timeout: 5 * 60 * 1000, maxBuffer: 20 * 1024 * 1024 },
-        (err, stdout, stderr) => {
-          if (err) {
-            err.stderrText = String(stderr || '');
-            return reject(err);
-          }
-          resolve();
-        }
-      );
-    });
-
-    // 3. Cari file hasilnya
-    const fileName = fs.readdirSync(outDir).find(f => f.startsWith(`${info.video_id}.`) && f.endsWith('.mp4'));
-    if (!fileName) {
-      return { success: false, error: 'FILE_NOT_FOUND', message: 'File hasil download tidak ditemukan' };
+    if (parsed.notVideo) {
+      return { success: false, error: 'NOT_A_VIDEO_LINK', message: 'Ini bukan link video. Kirim link video: youtube.com/watch?v=..., youtube.com/shorts/..., atau youtu.be/...' };
     }
-    const filePath = path.join(outDir, fileName);
-    const size = fs.statSync(filePath).size;
+    if (!parsed.id) {
+      return { success: false, error: 'INVALID_INPUT', message: 'Link atau ID video tidak valid' };
+    }
 
-    // 4. Caption informasi
+    const id = parsed.id;
+    const videoUrl = `https://www.youtube.com/watch?v=${id}`;
+    const audioLang = String(options.audioLang || 'id').trim() || 'id';
+    const key = `${id}:${audioLang}`;
+    let cached = false;
+    let data;
+
+    const hit = cache.get(key);
+    if (hit && Date.now() - hit.at < CACHE_TTL_MS) {
+      data = hit.data;
+      cached = true;
+    } else {
+      if (Date.now() < blockedUntil) {
+        const secs = Math.ceil((blockedUntil - Date.now()) / 1000);
+        return { success: false, error: 'RATE_LIMITED', message: `Situs sedang membatasi akses. Coba lagi dalam sekitar ${Math.ceil(secs / 60)} menit.`, retry_after: secs };
+      }
+
+      const res = await enqueue(() =>
+        fetch(`${BASE}/api/info`, {
+          method: 'POST',
+          headers: {
+            'User-Agent': USER_AGENT,
+            'Accept': '*/*',
+            'Accept-Language': 'id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7',
+            'Content-Type': 'application/json',
+            'Origin': BASE,
+            'Referer': `${BASE}/`
+          },
+          body: JSON.stringify({ url: videoUrl, audioLang }),
+          redirect: 'follow',
+          signal: AbortSignal.timeout(45000)
+        })
+      );
+
+      if (res.status === 429 || res.status === 403) {
+        blockedUntil = Date.now() + BLOCK_COOLDOWN_MS;
+        return { success: false, error: res.status === 429 ? 'RATE_LIMITED' : 'BLOCKED', status: res.status, message: 'Situs membatasi atau memblokir akses. Coba lagi nanti.' };
+      }
+
+      const raw = await res.text();
+      let json = null;
+      try { json = JSON.parse(raw); } catch { /* bukan JSON */ }
+      const apiMsg = json ? asText(json.error || json.message) : null;
+
+      if (res.status === 404) {
+        return { success: false, error: 'NOT_FOUND', message: apiMsg || 'Video tidak ditemukan' };
+      }
+      if (!res.ok) {
+        return { success: false, error: 'HTTP_ERROR', status: res.status, message: apiMsg || `Situs membalas HTTP ${res.status}` };
+      }
+      if (!json || json.success === false) {
+        return { success: false, error: 'API_ERROR', message: apiMsg || 'Situs membalas dengan data yang tidak dikenali' };
+      }
+      if (!json.data || !json.data.formats) {
+        return { success: false, error: 'NO_DATA', message: 'Data video tidak ditemukan. Video mungkin private, dibatasi umur, atau struktur API situs sudah berubah.' };
+      }
+
+      const d = json.data;
+      const f = d.formats;
+
+      data = {
+        id: d.id || id,
+        title: d.title || null,
+        channel: d.channel || null,
+        duration: { seconds: d.durationSeconds ?? null, display: d.durationFormatted || null },
+        views: { count: d.views ?? null, display: d.viewsFormatted || null },
+        thumbnail: d.thumbnail || null,
+        description: d.description || null,
+        audioLanguages: (d.audioLanguages || []).map((a) => ({ id: a.id, name: a.name, default: !!a.isDefault, indonesian: !!a.isIndonesian })),
+        selectedAudioLang: d.selectedAudioLang || null,
+        hasIndonesianAudio: !!d.hasIndonesianAudio,
+        formats: {
+          video: (f.videos || []).map(mapVideo),
+          audio: (f.audios || []).map(mapAudio),
+          video_only: (f.videoOnly || []).map(mapVideoOnly)
+        }
+      };
+
+      cache.set(key, { at: Date.now(), data });
+    }
+
+    const qualities = data.formats.video.map((v) => String(v.quality).replace(/\s*\(.*\)/, '')).join(', ');
+    const audios = data.formats.audio.map((a) => `${a.format} ${a.bitrate}`).join(', ');
+
     const caption =
-      `🎬 *${info.title || '-'}*\n\n` +
-      `👤 Channel : ${info.author || '-'}\n` +
-      `⏱️ Durasi  : ${fmtDur(info.duration)}\n` +
-      `👁️ Views   : ${fmtNum(info.view_count)}\n` +
-      `👍 Like    : ${fmtNum(info.like_count)}\n` +
-      `📅 Upload  : ${fmtDate(info.upload_date)}\n` +
-      `📦 Ukuran  : ${fmtSize(size)}\n` +
-      `🔗 ${info.original_url}`;
+      `🎬 *YouTube Downloader*\n\n` +
+      `📌 Judul    : ${data.title || '-'}\n` +
+      `📺 Channel  : ${data.channel || '-'}\n` +
+      `⏱️ Durasi   : ${data.duration.display || '-'}\n` +
+      `👁️ Views    : ${data.views.display || '-'}\n` +
+      `🎞️ Video    : ${qualities || '-'}\n` +
+      `🎵 Audio    : ${audios || '-'}\n` +
+      `\n${videoUrl}`;
 
     return {
       success: true,
-      original_url: info.original_url,
-      title: info.title,
-      author: info.author,
-      video_id: info.video_id,
-      duration: info.duration,
-      thumbnail: info.thumbnail,
-      max_quality: `${maxRes}p`,
-      file_path: filePath,
-      file_name: fileName,
-      filesize: size,
+      original_url: videoUrl,
+      id: data.id,
+      title: data.title,
+      channel: data.channel,
+      duration: data.duration,
+      views: data.views,
+      thumbnail: data.thumbnail,
+      description: data.description,
+      audio_languages: data.audioLanguages,
+      selected_audio_lang: data.selectedAudioLang,
+      has_indonesian_audio: data.hasIndonesianAudio,
+      formats: data.formats,
+      cached,
       caption
     };
 
   } catch (err) {
-    const text = String(err.stderrText || err.message || '');
-    if (err.code === 'ENOENT') {
-      return { success: false, error: 'YTDLP_NOT_INSTALLED', message: 'yt-dlp belum terpasang. Jalankan: pip install yt-dlp' };
+    if (err.name === 'TimeoutError' || err.name === 'AbortError') {
+      return { success: false, error: 'TIMEOUT', message: 'Request terlalu lama, coba lagi nanti' };
     }
-    if (text.toLowerCase().includes('ffmpeg')) {
-      return { success: false, error: 'FFMPEG_NOT_INSTALLED', message: 'ffmpeg belum terpasang. Jalankan: pkg install ffmpeg' };
-    }
-    if (err.killed || err.signal === 'SIGTERM') {
-      return { success: false, error: 'TIMEOUT', message: 'Download terlalu lama, coba kualitas lebih rendah' };
-    }
-    return { success: false, error: 'EXCEPTION', message: text.trim().slice(0, 300) };
+    return { success: false, error: 'EXCEPTION', message: err.message || String(err) };
   }
 }
 
-module.exports = { youtube, youtubeMp4 };
+module.exports = { ytDown };
 
-// Scrape link   : node youtube.js "https://youtu.be/xxxxx"
-// Download mp4  : node youtube.js mp4 "https://youtu.be/xxxxx" [720]
+// Info video            : node ytdown.js "https://youtube.com/shorts/X6hvU4KKqxU"
+// Pilih bahasa audio    : node ytdown.js "https://youtu.be/X6hvU4KKqxU" --lang=original
 if (require.main === module) {
   const args = process.argv.slice(2);
-  if (args[0] === 'mp4') {
-    youtubeMp4(args[1], { maxRes: Number(args[2]) || 720 }).then(r => console.log(JSON.stringify(r, null, 2)));
-  } else {
-    youtube(args[0]).then(r => console.log(JSON.stringify(r, null, 2)));
-  }
+  const langArg = args.find((a) => a.startsWith('--lang='));
+  ytDown(args[0], { audioLang: langArg ? langArg.split('=')[1] : undefined }).then((r) => console.log(JSON.stringify(r, null, 2)));
 }
