@@ -1,0 +1,372 @@
+/*
+ Name Scrape : FreeWebToApk (Website to APK + AAB)
+ Owner       : Kersio
+ Base Web    : https://freewebtoapk.com
+ Type        : Plugin / CLI (Node.js)
+ Function    : Ubah URL website jadi APK + AAB lewat server build, tanpa login
+ Input       : appName, websiteUrl, opts { out, version, color, format }
+ Output      : JSON { status, result: { files[], links[] } }
+ Saluran     : https://whatsapp.com/channel/0029VbDecTzElah1uM12wK2G
+ Require     : Node.js 18+ (tanpa npm install)
+ Note        : Format respons /api/build dideteksi otomatis (zip / apk / aab / json)
+*/
+
+const fs = require('fs')
+const path = require('path')
+const zlib = require('zlib')
+
+const BASE = 'https://freewebtoapk.com'
+
+// ---------- PNG encoder (tanpa library) ----------
+const CRC = (() => {
+  const t = new Uint32Array(256)
+  for (let n = 0; n < 256; n++) {
+    let c = n
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1
+    t[n] = c >>> 0
+  }
+  return t
+})()
+
+function crc32(buf) {
+  let c = 0xffffffff
+  for (let i = 0; i < buf.length; i++) c = CRC[(c ^ buf[i]) & 0xff] ^ (c >>> 8)
+  return (c ^ 0xffffffff) >>> 0
+}
+
+function pngChunk(type, data) {
+  const len = Buffer.alloc(4)
+  len.writeUInt32BE(data.length)
+  const td = Buffer.concat([Buffer.from(type), data])
+  const crc = Buffer.alloc(4)
+  crc.writeUInt32BE(crc32(td))
+  return Buffer.concat([len, td, crc])
+}
+
+function makePng(size, pixel) {
+  const stride = size * 4 + 1
+  const raw = Buffer.alloc(stride * size)
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const [r, g, b, a] = pixel(x, y)
+      const o = y * stride + 1 + x * 4
+      raw[o] = r; raw[o + 1] = g; raw[o + 2] = b; raw[o + 3] = a
+    }
+  }
+  const ihdr = Buffer.alloc(13)
+  ihdr.writeUInt32BE(size, 0)
+  ihdr.writeUInt32BE(size, 4)
+  ihdr[8] = 8
+  ihdr[9] = 6
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    pngChunk('IHDR', ihdr),
+    pngChunk('IDAT', zlib.deflateSync(raw)),
+    pngChunk('IEND', Buffer.alloc(0))
+  ])
+}
+
+// alpha 0..1 untuk rounded-rect berukuran `box` di tengah kanvas `size`
+function shapeAlpha(x, y, size, box, radius) {
+  const half = box / 2
+  const px = x + 0.5 - size / 2
+  const py = y + 0.5 - size / 2
+  const qx = Math.abs(px) - (half - radius)
+  const qy = Math.abs(py) - (half - radius)
+  const d = Math.hypot(Math.max(qx, 0), Math.max(qy, 0)) + Math.min(Math.max(qx, qy), 0) - radius
+  return Math.min(1, Math.max(0, 0.5 - d))
+}
+
+const hexToRgb = (hex) => {
+  const h = String(hex).replace('#', '')
+  return [parseInt(h.slice(0, 2), 16), parseInt(h.slice(2, 4), 16), parseInt(h.slice(4, 6), 16)]
+}
+const argb = (hex) => ((0xff << 24) | (parseInt(String(hex).replace('#', ''), 16) & 0xffffff)) >>> 0
+
+function buildIcons(color) {
+  const [r, g, b] = hexToRgb(color)
+  const dens = ['mdpi', 'hdpi', 'xhdpi', 'xxhdpi', 'xxxhdpi']
+  const icon = [48, 72, 96, 144, 192]
+  const fg = [108, 162, 216, 324, 432]
+  const files = []
+  dens.forEach((d, i) => {
+    const s = icon[i]
+    const f = fg[i]
+    const compose = (round) => makePng(s, (x, y) => {
+      const a = shapeAlpha(x, y, s, s, round ? s / 2 : s * 0.22)
+      const w = shapeAlpha(x, y, s, s * 0.42, s * 0.12)
+      const rr = Math.round(r + (255 - r) * w)
+      const gg = Math.round(g + (255 - g) * w)
+      const bb = Math.round(b + (255 - b) * w)
+      return [rr, gg, bb, Math.round(a * 255)]
+    })
+    files.push([`icon:mipmap-${d}-v4/ic_launcher.png`, compose(false)])
+    files.push([`icon:mipmap-${d}-v4/ic_launcher_round.png`, compose(true)])
+    files.push([`icon:mipmap-${d}-v4/ic_launcher_fg.png`, makePng(f, (x, y) => {
+      const w = shapeAlpha(x, y, f, f * 0.3, f * 0.09)
+      return [255, 255, 255, Math.round(w * 255)]
+    })])
+  })
+  return files
+}
+
+// ---------- ZIP reader minimal ----------
+function zipEntries(buf) {
+  let eocd = -1
+  for (let i = buf.length - 22; i >= Math.max(0, buf.length - 65557); i--) {
+    if (buf.readUInt32LE(i) === 0x06054b50) { eocd = i; break }
+  }
+  if (eocd < 0) return []
+  const total = buf.readUInt16LE(eocd + 10)
+  let p = buf.readUInt32LE(eocd + 16)
+  const out = []
+  for (let i = 0; i < total; i++) {
+    if (p + 46 > buf.length || buf.readUInt32LE(p) !== 0x02014b50) break
+    const method = buf.readUInt16LE(p + 10)
+    const csize = buf.readUInt32LE(p + 20)
+    const nlen = buf.readUInt16LE(p + 28)
+    const elen = buf.readUInt16LE(p + 30)
+    const clen = buf.readUInt16LE(p + 32)
+    const lho = buf.readUInt32LE(p + 42)
+    out.push({ name: buf.toString('utf8', p + 46, p + 46 + nlen), method, csize, lho })
+    p += 46 + nlen + elen + clen
+  }
+  return out
+}
+
+function zipRead(buf, e) {
+  const nlen = buf.readUInt16LE(e.lho + 26)
+  const elen = buf.readUInt16LE(e.lho + 28)
+  const start = e.lho + 30 + nlen + elen
+  const data = buf.subarray(start, start + e.csize)
+  return e.method === 0 ? Buffer.from(data) : zlib.inflateRawSync(data)
+}
+
+function kindOf(buf) {
+  if (buf.length > 4 && buf[0] === 0x50 && buf[1] === 0x4b) {
+    const names = zipEntries(buf).map((e) => e.name)
+    if (names.includes('AndroidManifest.xml')) return 'apk'
+    if (names.includes('BundleConfig.pb') || names.includes('base/manifest/AndroidManifest.xml')) return 'aab'
+    return 'zip'
+  }
+  return 'bin'
+}
+
+// ---------- simpan hasil ----------
+function save(out, name, buf) {
+  fs.mkdirSync(out, { recursive: true })
+  const p = path.resolve(out, name)
+  fs.writeFileSync(p, buf)
+  return { name, path: p, size: buf.length }
+}
+
+// cari zip (APK/AAB) di dalam buffer, walau dibungkus header/framing sendiri
+function scanZips(buf) {
+  const sig = Buffer.from([0x50, 0x4b, 0x05, 0x06])
+  const found = []
+  let i = buf.indexOf(sig)
+  while (i !== -1) {
+    if (i + 22 <= buf.length) {
+      const cdSize = buf.readUInt32LE(i + 12)
+      const cdOff = buf.readUInt32LE(i + 16)
+      const cLen = buf.readUInt16LE(i + 20)
+      const start = i - cdSize - cdOff
+      const end = i + 22 + cLen
+      if (start >= 0 && end <= buf.length &&
+        buf.readUInt32LE(start) === 0x04034b50 && buf.readUInt32LE(start + cdOff) === 0x02014b50) {
+        found.push({ start, end })
+      }
+    }
+    i = buf.indexOf(sig, i + 1)
+  }
+  return found
+    .filter((a) => !found.some((b) => b !== a && b.start <= a.start && b.end >= a.end && (b.start < a.start || b.end > a.end)))
+    .sort((a, b) => a.start - b.start)
+    .map((s) => buf.subarray(s.start, s.end))
+}
+
+function saveBinary(out, slug, buf) {
+  const kind = kindOf(buf)
+  if (kind === 'apk' || kind === 'aab') return [save(out, `${slug}.${kind}`, buf)]
+  if (kind === 'zip') {
+    const ents = zipEntries(buf).filter((e) => /\.(apk|aab)$/i.test(e.name))
+    if (ents.length) return ents.map((e) => save(out, path.basename(e.name), zipRead(buf, e)))
+    return [save(out, `${slug}.zip`, buf)]
+  }
+  const segs = scanZips(buf)
+  if (segs.length) {
+    const used = {}
+    return segs.map((s) => {
+      const ext = kindOf(s) === 'bin' ? 'bin' : kindOf(s)
+      used[ext] = (used[ext] || 0) + 1
+      return save(out, `${slug}${used[ext] > 1 ? '-' + used[ext] : ''}.${ext}`, s)
+    })
+  }
+  return [save(out, `${slug}.bin`, buf)]
+}
+
+const headOf = (buf) => ({
+  hex: buf.subarray(0, 64).toString('hex'),
+  ascii: buf.subarray(0, 64).toString('latin1').replace(/[^\x20-\x7e]/g, '.')
+})
+
+function walk(v, key, acc) {
+  if (typeof v === 'string') {
+    if (/^https?:\/\//i.test(v)) acc.links.push(v)
+    else if (v.startsWith('/') && /\.(apk|aab)(\?|$)/i.test(v)) acc.links.push(BASE + v)
+    else if (v.length > 2000 && /^[A-Za-z0-9+/=\r\n]+$/.test(v.slice(0, 500))) {
+      acc.blobs.push(Buffer.from(v, 'base64'))
+      return `[base64 ${v.length} chars]`
+    }
+    return v
+  }
+  if (Array.isArray(v)) return v.map((x, i) => walk(x, `${key}[${i}]`, acc))
+  if (v && typeof v === 'object') {
+    const o = {}
+    for (const k of Object.keys(v)) o[k] = walk(v[k], k, acc)
+    return o
+  }
+  return v
+}
+
+// ---------- fungsi utama ----------
+async function freewebtoapk(appName, websiteUrl, opts = {}) {
+  try {
+    appName = String(appName || '').trim()
+    websiteUrl = String(websiteUrl || '').trim()
+    if (!appName) throw new Error('Nama app wajib diisi')
+    if (appName.length > 30) throw new Error('Nama app maksimal 30 karakter')
+    if (!/^https:\/\//i.test(websiteUrl)) throw new Error('URL harus diawali https://')
+    new URL(websiteUrl)
+
+    const color = opts.color || '#00D4FF'
+    const out = opts.out || 'output'
+    const slug = appName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '') || 'app'
+
+    const config = {
+      appName, websiteUrl, sourceType: 'url', sourceLabel: '', sourceFileCount: 0,
+      appVersion: opts.version || '1.0.0', versionCode: '',
+      iconOption: 'generate', iconText: '', iconBgColor: color, iconShape: 'rounded',
+      enableSplash: true, splashBgColor: '#0A0F1C', splashTextColor: '#FFFFFF', splashLogoPosition: 'center',
+      screenMode: 'fullscreen', orientation: 'auto', externalLinks: 'internal',
+      enableDownloads: true, enablePullRefresh: true, exitConfirmation: true,
+      packageName: '', developerWebsite: '',
+      enableAdmob: false, admobPublisherId: '', admobBannerId: '', adPlacement: 'bottom',
+      enablePush: false, onesignalAppId: '', permissionsDeclared: true,
+      permCamera: true, permMicrophone: false, permLocation: false, permStorage: false,
+      permContacts: false, permPhone: false, permBluetooth: false, permNfc: false,
+      enableSideMenu: true, sideMenuColor: '#6366F1', appBarColor: '#6366F1',
+      aboutUs: '', contactEmail: '', contactPhone: '',
+      enableAboutUs: true, enablePrivacyPolicyItem: true, enableContactUs: true,
+      enableShareApp: true, enableRateApp: true,
+      youtubeLink: '', telegramLink: '', instagramLink: '', twitterLink: '',
+      enableLiveChat: false, chatWidgetCode: '', chatButtonLabel: 'Live Chat',
+      enablePinLock: false, pinCode: '', privacyPolicyType: 'auto', privacyPolicyUrl: '',
+      appMode: 'url', liveDevPort: '5173', galleryScrollDirection: 'horizontal',
+      mediaAutoPlay: false, mediaRememberPosition: true,
+      admobAppId: '', adControl: 'automatic', enableBannerAd: true, fullScreenAdType: '',
+      fullScreenTrigger: 'actions', fullScreenActionCount: 4,
+      interstitialAdId: '', rewardAdId: '', mrecAdId: '', rewardedInterstitialAdId: '', appOpenAdId: '',
+      enableMediation: false, mediationNetworks: ['inmobi'], pushProvider: 'none',
+      enableTopBar: true, enableFullscreenToggle: false, statusBarColor: '',
+      enableBottomNav: false, bottomNavStyle: 'controls', bottomTabs: [], bottomNavColor: '', bottomNavLabels: true,
+      enableZoom: true, enableClickSound: true, desktopMode: false, userAgent: '', enableExitButton: true,
+      customMenuLinks: [], customJs: '', customCss: '', userScripts: [],
+      enableOfflineCache: false, enablePersistentCache: true, enableAdBlocking: false, requiresNetwork: false,
+      enableBackgroundAudio: false, enableMediaNotification: false, enablePipMode: false,
+      enableTextRecognition: false, enableJsxRuntime: false, enableCapacitorPlugins: true,
+      enableIap: false, iapProductId: '', enableIapCatalog: false,
+      remoteUpdateEnabled: false, remoteManifestUrl: '', enableDeepLinks: false, enableFileOpen: false,
+      shareText: true, shareDataFiles: true, shareImages: false, shareVideos: false, shareAudio: false, shareDocuments: false,
+      permContactsWrite: false, permCalendar: false, permSms: false, permCallLog: false, permBiometric: false,
+      permNotifications: false, permReminders: false, permFolder: false, permKeystore: false,
+      permAlarmClock: false, permDndAccess: false, permExactAlarmApp: false,
+      bgKeepRunning: false, bgServiceType: 'dataSync', bgLocation: false, bgGeofencing: false,
+      bgStartOnBoot: false, bgTasks: false, bgBatteryDialog: false,
+      ocr_devanagari: false, ocr_chinese: false, ocr_japanese: false, ocr_korean: false,
+      enableDeviceIntegrity: false, integrityCloudProjectNumber: '', enableAndroidTv: false, enableHealthConnect: false,
+      facebookEnabled: false, facebookAppId: '', facebookClientToken: '', facebookAppEvents: false,
+      firebaseAnalytics: false, analyticsScreenViews: false, revenueCatEnabled: false, revenueCatApiKey: '',
+      splashScaleMode: 'fit', splashVideoSkippable: true, splashFadeOut: false, showSplashAppName: true,
+      splashLoadingStyle: 'spinner', backgroundMusicVolume: 40,
+      hasSplashVideo: false, hasMusic: false, hasErrorImage: false, hasGoogleServices: false,
+      outputFormat: opts.format || 'apk', currentStep: 5, lastUpdated: Date.now()
+    }
+    for (const m of ['steps', 'distance', 'calories', 'heartRate', 'sleep', 'weight', 'exercise']) {
+      config[`healthRead_${m}`] = false
+      config[`healthWrite_${m}`] = false
+    }
+
+    const form = new FormData()
+    form.append('config', JSON.stringify(config))
+    form.append('art', JSON.stringify({ windowBg: argb(config.splashBgColor), iconBg: argb(color) }))
+    for (const [name, buf] of buildIcons(color)) {
+      form.append(name, new Blob([buf], { type: 'image/png' }), 'blob')
+    }
+
+    const res = await fetch(`${BASE}/api/build`, {
+      method: 'POST',
+      headers: {
+        accept: '*/*',
+        origin: BASE,
+        referer: `${BASE}/generator/download-apk`,
+        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130 Safari/537.36'
+      },
+      body: form,
+      signal: AbortSignal.timeout(opts.timeout || 180000)
+    })
+
+    const buf = Buffer.from(await res.arrayBuffer())
+    const contentType = res.headers.get('content-type') || ''
+
+    if (!res.ok) {
+      return { status: false, creator: 'Kersio', code: res.status, contentType, message: buf.toString('utf8', 0, 500) }
+    }
+
+    let files = []
+    let links = []
+    let json
+
+    if (/json/i.test(contentType) || buf[0] === 0x7b) {
+      const acc = { links: [], blobs: [] }
+      json = walk(JSON.parse(buf.toString('utf8')), 'root', acc)
+      links = [...new Set(acc.links)]
+      acc.blobs.forEach((b, i) => files.push(...saveBinary(out, `${slug}${acc.blobs.length > 1 ? '-' + (i + 1) : ''}`, b)))
+    } else {
+      files = saveBinary(out, slug, buf)
+    }
+
+    const head = files.length === 1 && /\.bin$/.test(files[0].name) ? headOf(buf) : undefined
+
+    return {
+      status: true,
+      creator: 'Kersio',
+      result: { appName, websiteUrl, contentType, bytes: buf.length, files, links, json, head }
+    }
+  } catch (e) {
+    return { status: false, creator: 'Kersio', message: e.message }
+  }
+}
+
+module.exports = freewebtoapk
+module.exports._internal = { makePng, buildIcons, zipEntries, zipRead, kindOf, saveBinary }
+
+if (require.main === module) {
+  const args = process.argv.slice(2)
+  const flag = (n) => { const i = args.indexOf(`--${n}`); return i > -1 ? args.splice(i, 2)[1] : undefined }
+  const opts = { out: flag('out'), version: flag('ver'), color: flag('color'), format: flag('format') }
+  const split = flag('split')
+  if (split) {
+    // pisah file .bin hasil build sebelumnya tanpa build ulang
+    const b = fs.readFileSync(split)
+    const files = saveBinary(opts.out || path.dirname(path.resolve(split)), path.basename(split).replace(/\.[^.]+$/, ''), b)
+    console.log(JSON.stringify({ status: true, creator: 'Kersio', files, head: files.length === 1 ? headOf(b) : undefined }, null, 2))
+    process.exit(0)
+  }
+  const [name, url] = args
+  if (!name || !url) {
+    console.log('Pemakaian: node freewebtoapk.js <nama> <https://url> [--out folder] [--ver 1.0.0] [--color #00D4FF] [--format apk|aab]')
+    process.exit(1)
+  }
+  freewebtoapk(name, url, opts).then((r) => console.log(JSON.stringify(r, null, 2)))
+}
